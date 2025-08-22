@@ -1,16 +1,22 @@
 {
-  "name": "wagent",
+  "name": "wasm-agent-runner",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "A project to run a Python agent in a WASM environment.",
+  "type": "module",
+  "main": "run.mjs",
   "scripts": {
+    "clean": "rm -rf dist vendor",
+    "compile": "node compile.mjs",
+    "vendor": "node vendor.mjs",
+    "package": "node package.mjs",
+    "build": "npm run clean && npm run compile && npm run vendor && npm run package",
+    "start": "node run.mjs",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "commonjs",
   "dependencies": {
-    "pyodide": "^0.28.2"
+    "pyodide": "0.24.1"
   }
 }

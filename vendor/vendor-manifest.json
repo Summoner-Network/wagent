@@ -1,0 +1,14 @@
+{
+  "timestamp": "2025-08-22T17:23:46.723Z",
+  "pyodide_version": "0.25.1",
+  "python_version": "3.11.3",
+  "architecture": "wasm32",
+  "requested_packages": [
+    "numpy"
+  ],
+  "resolved_packages": [
+    "numpy"
+  ],
+  "vendored_count": 1,
+  "skipped_count": 0
+}
