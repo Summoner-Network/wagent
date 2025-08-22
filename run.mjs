@@ -26,14 +26,50 @@ const UNPACK_ROOT = path.join(DIST, "_artifacts");
 const CODE_UNPACK = path.join(UNPACK_ROOT, "code");
 const DEPS_UNPACK = path.join(UNPACK_ROOT, "deps");
 
+/* ========== Agent Registry ========== */
+let agentRegistry = null;
+
+async function loadAgentRegistry(pyodide) {
+  try {
+    const registryData = pyodide.FS.readFile("/app/agent_registry.json", { encoding: "utf8" });
+    agentRegistry = JSON.parse(registryData);
+    log("agent.registry.loaded", { 
+      agentCount: agentRegistry.agents.length,
+      rootAgent: agentRegistry.rootAgent,
+      agents: agentRegistry.agents.map(a => a.name)
+    });
+    return agentRegistry;
+  } catch (e) {
+    fail("agent.registry.load.fail", { err: String(e?.message || e) });
+  }
+}
+
+function getAgentModulePath(agentName) {
+  if (!agentRegistry) {
+    fail("agent.registry.not.loaded");
+  }
+  
+  const agent = agentRegistry.agents.find(a => a.name === agentName);
+  if (!agent) {
+    fail("agent.not.found", { 
+      agentName, 
+      available: agentRegistry.agents.map(a => a.name)
+    });
+  }
+  
+  return agent.modulePath;
+}
+
 /* ========== Helpers ========== */
 async function sha256(filePath) {
   const buf = await fs.readFile(filePath);
   return crypto.createHash("sha256").update(buf).digest("hex");
 }
+
 async function ensureFile(p) {
   try { await fs.access(p); } catch { fail("file.missing", { path: p }); }
 }
+
 async function verifyArchive(archivePath, manifestPath, key = "archive_sha256") {
   await ensureFile(archivePath);
   await ensureFile(manifestPath);
@@ -45,11 +81,13 @@ async function verifyArchive(archivePath, manifestPath, key = "archive_sha256") 
   log("archive.verified", { archive: path.basename(archivePath), sha256: have });
   return manifest;
 }
+
 async function cleanUnpack() {
   await fs.rm(UNPACK_ROOT, { recursive: true, force: true });
   await fs.mkdir(CODE_UNPACK, { recursive: true });
   await fs.mkdir(DEPS_UNPACK, { recursive: true });
 }
+
 async function unpack() {
   log("unpack.begin", { archive: path.basename(CODE_ARCHIVE) });
   await tar.x({ file: CODE_ARCHIVE, cwd: CODE_UNPACK, strip: 0 });
@@ -57,6 +95,7 @@ async function unpack() {
   await tar.x({ file: DEPS_ARCHIVE, cwd: DEPS_UNPACK, strip: 0 });
   log("unpack.complete");
 }
+
 async function writeDirToVFS(pyodide, localDir, vfsDir) {
   const FS = pyodide.FS;
   try { FS.mkdirTree(vfsDir); } catch {}
@@ -112,10 +151,9 @@ print("BOOTSTRAP_WHEEL_INSTALLED", wheel)
 }
 
 async function installBootstrap(pyodide, wheelNames) {
-  // site-packages in Pyodide
   const sitePackages = "/lib/python3.11/site-packages";
   pyodide.FS.mkdirTree("/tmp/wheels");
-  const need = ["micropip", "packaging"]; // plus their deps if present
+  const need = ["micropip", "packaging"];
 
   const chosen = wheelNames.filter(n =>
     need.some(k => n.startsWith(`${k}-`))
@@ -144,10 +182,9 @@ async function installBootstrap(pyodide, wheelNames) {
 }
 
 async function installRemainingWithMicropip(pyodide, wheelNames) {
-  await installMicropipIfMissing(pyodide); // safety, no-op if installed
+  await installMicropipIfMissing(pyodide);
 
   const micropip = pyodide.pyimport("micropip");
-  // Exclude bootstrap wheels from the remaining installs
   const rest = wheelNames.filter(n => !n.startsWith("micropip-") && !n.startsWith("packaging-"));
   for (const wheel of rest) {
     log("micropip.install.begin", { wheel });
@@ -164,44 +201,60 @@ async function installMicropipIfMissing(pyodide) {
   try {
     pyodide.runPython("import micropip");
   } catch {
-    // try import again after bootstrap
     try { pyodide.runPython("import micropip"); }
     catch (e) { fail("micropip.absent.postbootstrap", { err: String(e?.message || e) }); }
   }
 }
 
-async function executeAgentTask(pyodide, agentName, inputData) {
+async function executeAgentTask(pyodide, agentName, inputData, agentConfig = {}) {
   log("agent.exec.begin", { agentName });
+  
   const vfsTapesPath = "/tapes";
   const inputTapePath = path.join(vfsTapesPath, "in.json");
   const outputTapePath = path.join(vfsTapesPath, "out.json");
 
-  const moduleMapping = { main: "agent.main", multiplier: "multiplier.main" };
-  const agentModulePath = moduleMapping[agentName] || `${agentName}.main`;
+  // Get module path from registry
+  const agentModulePath = getAgentModulePath(agentName);
+  log("agent.module.resolve", { agentName, modulePath: agentModulePath });
 
-  const agentModule = pyodide.pyimport(agentModulePath);
-  const agentConfig = agentName === "main" ? { vector: [1,1,1] } : {};
-  const agentInstance = agentModule.main(pyodide.toPy(agentConfig));
+  try {
+    // Import the agent module
+    const agentModule = pyodide.pyimport(agentModulePath);
+    
+    // Create agent instance with config
+    const agentInstance = agentModule.main(pyodide.toPy(agentConfig));
 
-  const traceId = crypto.randomUUID();
-  const tapeInput = { trace_id: traceId, payload: inputData };
+    const traceId = crypto.randomUUID();
+    const tapeInput = { trace_id: traceId, payload: inputData };
 
-  pyodide.FS.mkdirTree(vfsTapesPath);
-  pyodide.FS.writeFile(inputTapePath, JSON.stringify(tapeInput));
-  agentInstance.run(inputTapePath, outputTapePath);
+    pyodide.FS.mkdirTree(vfsTapesPath);
+    pyodide.FS.writeFile(inputTapePath, JSON.stringify(tapeInput));
+    
+    // Execute agent
+    agentInstance.run(inputTapePath, outputTapePath);
 
-  const resultRaw = pyodide.FS.readFile(outputTapePath, { encoding: "utf8" });
-  const resultData = JSON.parse(resultRaw);
+    const resultRaw = pyodide.FS.readFile(outputTapePath, { encoding: "utf8" });
+    const resultData = JSON.parse(resultRaw);
 
-  if (resultData.trace_id !== traceId) fail("trace.mismatch", { expect: traceId, got: resultData.trace_id });
+    if (resultData.trace_id !== traceId) {
+      fail("trace.mismatch", { expect: traceId, got: resultData.trace_id });
+    }
 
-  log("agent.exec.ok", { agentName, status: resultData.status });
-  return resultData;
+    log("agent.exec.ok", { agentName, status: resultData.status });
+    return resultData;
+    
+  } catch (e) {
+    fail("agent.exec.fail", { 
+      agentName, 
+      modulePath: agentModulePath,
+      err: String(e?.message || e) 
+    });
+  }
 }
 
 /* ========== Main Orchestration ========== */
 async function main() {
-  log("begin", { mode: "artifact-driven" });
+  log("begin", { mode: "artifact-driven-dynamic" });
 
   // 1) Verify artifacts
   await verifyArchive(CODE_ARCHIVE, CODE_MANIFEST);
@@ -232,7 +285,10 @@ print('PY_PATH_OK', '/app' in sys.path)
   `.trim());
   log("app.vfs.ready");
 
-  // 5) Stage wheels into VFS and offline-install
+  // 5) Load agent registry
+  await loadAgentRegistry(pyodide);
+
+  // 6) Stage wheels and install dependencies
   const hostVendorDir = path.join(DEPS_UNPACK, "vendor");
   pyodide.FS.mkdirTree("/tmp/wheels");
   const wheelNames = await stageWheelsToVFS(pyodide, hostVendorDir);
@@ -241,34 +297,108 @@ print('PY_PATH_OK', '/app' in sys.path)
   await installBootstrap(pyodide, wheelNames);
   await installRemainingWithMicropip(pyodide, wheelNames);
 
-  // 6) Boot audits
+  // 7) Boot audits
   try {
-    pyodide.runPython("import numpy, sys; print('✅ NumPy', numpy.__version__)");
-    log("audit.numpy.ok");
+    pyodide.runPython("import sys; print('✅ Python', sys.version.split()[0])");
+    log("audit.python.ok");
+    
+    // Test import of available packages
+    try {
+      pyodide.runPython("import numpy; print('✅ NumPy', numpy.__version__)");
+      log("audit.numpy.ok");
+    } catch {
+      log("audit.numpy.skip", {}, "warn");
+    }
   } catch (e) {
-    fail("audit.numpy.fail", { err: String(e?.message || e) });
+    fail("audit.python.fail", { err: String(e?.message || e) });
   }
 
-  // 7) Orchestration loop
-  let nextTask = { agentName: "main", inputData: { vector: [2, 4, 6] } };
+  // 8) Orchestration loop - start with root agent
+  const rootAgentName = agentRegistry.rootAgent;
+  let nextTask = { 
+    agentName: rootAgentName, 
+    inputData: { vector: [2, 4, 6] },
+    agentConfig: { vector: [1, 1, 1], target_threshold: 100 }  // Default config for root agent
+  };
   let finalResult = null;
+  let stepCount = 0;
+  const maxSteps = 20; // Allow more steps for iterative patterns
+  
+  // Track progress for infinite loop detection
+  let progressHistory = [];
+  let stagnantSteps = 0;
+  const maxStagnantSteps = 5;
 
-  while (nextTask) {
-    const res = await executeAgentTask(pyodide, nextTask.agentName, nextTask.inputData);
+  log("workflow.start", { rootAgent: rootAgentName, targetThreshold: 100 });
+
+  while (nextTask && stepCount < maxSteps) {
+    stepCount++;
+    log("workflow.step", { step: stepCount, agentName: nextTask.agentName });
+    
+    const res = await executeAgentTask(
+      pyodide, 
+      nextTask.agentName, 
+      nextTask.inputData,
+      nextTask.agentConfig || {}
+    );
+    
     if (res.status === "complete") {
       finalResult = res.result;
-      log("workflow.complete", { result: finalResult });
+      log("workflow.complete", { result: finalResult, steps: stepCount, progressHistory });
       nextTask = null;
     } else if (res.status === "pending" && res.action?.type === "run_agent") {
       const p = res.action.payload;
-      log("workflow.pending", { next: p.agent_name });
-      nextTask = { agentName: p.agent_name, inputData: p.input_data };
+      
+      // Track progress to detect infinite loops
+      const currentProgress = p.input_data.processed_result || p.input_data.number || 0;
+      progressHistory.push({ step: stepCount, agent: nextTask.agentName, progress: currentProgress });
+      
+      // Check if we're making progress
+      if (progressHistory.length >= 2) {
+        const lastProgress = progressHistory[progressHistory.length - 2].progress;
+        if (currentProgress <= lastProgress) {
+          stagnantSteps++;
+        } else {
+          stagnantSteps = 0; // Reset if we made progress
+        }
+      }
+      
+      if (stagnantSteps >= maxStagnantSteps) {
+        fail("workflow.stagnant", { 
+          stagnantSteps, 
+          maxStagnantSteps, 
+          progressHistory,
+          msg: "Workflow appears stuck - no progress being made"
+        });
+      }
+      
+      log("workflow.pending", { 
+        next: p.agent_name, 
+        step: stepCount, 
+        currentProgress,
+        stagnantSteps 
+      });
+      
+      nextTask = { 
+        agentName: p.agent_name, 
+        inputData: p.input_data,
+        agentConfig: p.agent_config || {}
+      };
     } else {
-      fail("agent.response.invalid", { res });
+      fail("agent.response.invalid", { res, step: stepCount });
     }
   }
 
-  log("end", { finalResult });
+  if (stepCount >= maxSteps) {
+    fail("workflow.max.steps", { 
+      maxSteps, 
+      finalStep: stepCount, 
+      progressHistory,
+      msg: "Reached maximum workflow steps" 
+    });
+  }
+
+  log("end", { finalResult, totalSteps: stepCount });
 }
 
 main().catch(err => fail("fatal", { err: String(err?.message || err) }));

@@ -21,12 +21,35 @@ class MultiplierAgent:
         result = number * factor
         print(f"[MultiplierAgent] Result: {result}")
 
-        # Always complete - multiplier is a simple operation
-        output_data = {
-            "trace_id": trace_id,
-            "status": "complete",
-            "result": float(result)
-        }
+        # Check if we need to return to another agent for further processing
+        return_to = payload.get("return_to")
+        original_payload = payload.get("original_payload", {})
+        
+        if return_to:
+            print(f"[MultiplierAgent] Returning result to {return_to} for further processing")
+            # Return to the specified agent with the processed result
+            output_data = {
+                "trace_id": trace_id,
+                "status": "pending",
+                "action": {
+                    "type": "run_agent",
+                    "payload": {
+                        "agent_name": return_to,
+                        "input_data": {
+                            **original_payload,  # Include original context
+                            "processed_result": float(result)  # Add our processed result
+                        }
+                    }
+                }
+            }
+        else:
+            # No return specified - this is a terminal operation
+            print("[MultiplierAgent] No return agent specified. Completing task.")
+            output_data = {
+                "trace_id": trace_id,
+                "status": "complete",
+                "result": float(result)
+            }
         
         print(f"[MultiplierAgent] Writing to output tape: {output_tape_path}")
         with open(output_tape_path, 'w') as f:

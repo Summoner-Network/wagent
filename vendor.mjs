@@ -38,6 +38,57 @@ async function fetchToFile(url, outPath, attempts = 3) {
   }
 }
 
+async function discoverRequirements(rootDir) {
+  const entries = await fs.readdir(rootDir, { withFileTypes: true });
+  const discovered = new Set();
+  let agentDirsFound = 0;
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    
+    const dirName = entry.name;
+    
+    // Check if this is an agent directory
+    if (dirName !== "agent" && !dirName.startsWith("agent-")) {
+      continue;
+    }
+    
+    const reqPath = path.join(rootDir, dirName, "requirements.txt");
+    try {
+      const content = await fs.readFile(reqPath, "utf-8");
+      const requirements = content
+        .split("\n")
+        .map(s => s.trim())
+        .filter(Boolean)
+        .filter(line => !line.startsWith("#")); // Skip comments
+      
+      requirements.forEach(req => {
+        // Handle version specifiers (numpy>=1.0 -> numpy)
+        const pkgName = req.split(/[>=<!=]/)[0].trim();
+        if (pkgName) discovered.add(pkgName);
+      });
+      
+      agentDirsFound++;
+      log("requirements.found", { 
+        dir: dirName, 
+        count: requirements.length,
+        requirements: requirements
+      });
+    } catch (e) {
+      // Missing requirements.txt is fine
+      log("requirements.missing", { dir: dirName }, "warn");
+    }
+  }
+
+  if (agentDirsFound === 0) {
+    fail("no.agent.dirs", { 
+      msg: "No agent directories found (looking for 'agent' or 'agent-*')"
+    });
+  }
+
+  return discovered;
+}
+
 /* Resolve full dependency closure using pyodide-lock.json */
 function resolveDependencies(rootPkgs, packagesData) {
   const resolved = new Set();
@@ -47,7 +98,6 @@ function resolveDependencies(rootPkgs, packagesData) {
     if (resolved.has(name)) continue;
     const info = packagesData[name];
     if (!info) {
-      // not in Pyodide distribution
       log("pkg.missing.in.lock", { name }, "warn");
       continue;
     }
@@ -65,34 +115,37 @@ async function vendorDependencies() {
   await fs.rm(vendorPath, { recursive: true, force: true });
   await fs.mkdir(vendorPath, { recursive: true });
 
-  // 1) Collect requirements from all agent*/requirements.txt
+  // 1) Discover requirements from all agent directories
   const rootDir = path.resolve(".");
-  const entries = await fs.readdir(rootDir, { withFileTypes: true });
-  const agentDirs = entries.filter(e => e.isDirectory() && e.name.startsWith("agent")).map(e => e.name);
-
-  const discovered = new Set();
-  for (const d of agentDirs) {
-    const reqPath = path.join(d, "requirements.txt");
-    try {
-      const content = await fs.readFile(reqPath, "utf-8");
-      content
-        .split("\n")
-        .map(s => s.trim())
-        .filter(Boolean)
-        .forEach(x => discovered.add(x));
-      log("requirements.found", { dir: d, count: content.split("\n").filter(Boolean).length });
-    } catch {
-      // missing file is fine
-    }
-  }
+  const discovered = await discoverRequirements(rootDir);
 
   // Bootstrap packages for offline micropip flow
   ["micropip", "packaging"].forEach(x => discovered.add(x));
 
   const requested = Array.from(discovered).sort();
-  log("requirements.combined", { requested });
+  log("requirements.combined", { 
+    count: requested.length,
+    requested 
+  });
 
-  // 2) Load pyodide-lock.json via createRequire to avoid cwd issues
+  if (requested.length === 0) {
+    log("no.requirements", { msg: "No Python requirements found" }, "warn");
+    // Still create empty manifest
+    const manifest = {
+      timestamp: new Date().toISOString(),
+      pyodide_version: "unknown",
+      python_version: "unknown",
+      requested_packages: [],
+      resolved_packages: [],
+      files: []
+    };
+    await fs.writeFile(path.join(vendorPath, "vendor-manifest.json"), JSON.stringify(manifest, null, 2));
+    log("manifest.written", { vendorPath, ok: 0, skip: 0, files: 0 });
+    log("complete");
+    return;
+  }
+
+  // 2) Load pyodide-lock.json
   let packagesMeta;
   let lockPath;
   try {
