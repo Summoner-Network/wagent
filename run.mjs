@@ -25,7 +25,15 @@ async function run() {
   const vfsAppPath = "/app";
 
   console.log("Loading Pyodide runtime...");
-  const pyodide = await loadPyodide();
+  // Hotwire stdout and stderr to the host's console
+  const pyodide = await loadPyodide({
+    stdout: (text) => {
+      console.log(`[Python STDOUT] ${text}`);
+    },
+    stderr: (text) => {
+      console.error(`[Python STDERR] ${text}`);
+    },
+  });
 
   // Recursively write the entire project from 'dist' to the virtual FS
   console.log(`Writing project files from '${path.basename(distPath)}' to VFS at '${vfsAppPath}'...`);
