@@ -1,14 +1,32 @@
 {
-  "timestamp": "2025-08-22T17:23:46.723Z",
+  "timestamp": "2025-08-22T18:14:49.811Z",
   "pyodide_version": "0.25.1",
   "python_version": "3.11.3",
-  "architecture": "wasm32",
   "requested_packages": [
-    "numpy"
+    "micropip",
+    "numpy",
+    "packaging"
   ],
   "resolved_packages": [
-    "numpy"
+    "micropip",
+    "numpy",
+    "packaging"
   ],
-  "vendored_count": 1,
-  "skipped_count": 0
+  "files": [
+    {
+      "filename": "micropip-0.5.0-py3-none-any.whl",
+      "size": 144917,
+      "sha256": "8df6295822c842e312c71eee20c8561343b7a8f3b0f6a5debb91d390ae0d7d1e"
+    },
+    {
+      "filename": "numpy-1.26.4-cp311-cp311-emscripten_3_1_46_wasm32.whl",
+      "size": 12547221,
+      "sha256": "887f7b1ec5e8e0b545b081ae64fdd893f75f8643e069ff6c2585cf20252f6a71"
+    },
+    {
+      "filename": "packaging-23.1-py3-none-any.whl",
+      "size": 157211,
+      "sha256": "952adfd0fbede825af3ddd33cf288778a247ef83d92de2118d02e7d188e2d917"
+    }
+  ]
 }

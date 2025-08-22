@@ -1,215 +1,274 @@
 import { loadPyodide } from "pyodide";
-import path from "path";
 import fs from "fs/promises";
+import path from "path";
+import * as tar from "tar";
 import crypto from "crypto";
 
-// Helper to recursively write a local directory to the virtual FS
-async function writeProjectToVFS(pyodide, localPath, vfsPath) {
-  await pyodide.FS.mkdirTree(vfsPath);
-  const entries = await fs.readdir(localPath, { withFileTypes: true });
-  for (let entry of entries) {
-    const localEntryPath = path.join(localPath, entry.name);
-    const vfsEntryPath = path.join(vfsPath, entry.name);
-    if (entry.isDirectory()) {
-      await writeProjectToVFS(pyodide, localEntryPath, vfsEntryPath);
-    } else {
-      const content = await fs.readFile(localEntryPath);
-      pyodide.FS.writeFile(vfsEntryPath, content);
+/* ========== Structured Logger ========== */
+function now() { return new Date().toISOString(); }
+function log(event, data = {}, level = "info") {
+  const rec = { ts: now(), stage: "run", level, event, ...data };
+  process.stdout.write(JSON.stringify(rec) + "\n");
+}
+function fail(event, data = {}) {
+  log(event, { ...data }, "error");
+  process.exit(1);
+}
+
+/* ========== Paths ========== */
+const DIST = path.resolve("./dist");
+const CODE_ARCHIVE = path.join(DIST, "code-artifact.tar.gz");
+const DEPS_ARCHIVE = path.join(DIST, "deps-artifact.tar.gz");
+const CODE_MANIFEST = path.join(DIST, "code-manifest.json");
+const DEPS_MANIFEST = path.join(DIST, "deps-manifest.json");
+
+const UNPACK_ROOT = path.join(DIST, "_artifacts");
+const CODE_UNPACK = path.join(UNPACK_ROOT, "code");
+const DEPS_UNPACK = path.join(UNPACK_ROOT, "deps");
+
+/* ========== Helpers ========== */
+async function sha256(filePath) {
+  const buf = await fs.readFile(filePath);
+  return crypto.createHash("sha256").update(buf).digest("hex");
+}
+async function ensureFile(p) {
+  try { await fs.access(p); } catch { fail("file.missing", { path: p }); }
+}
+async function verifyArchive(archivePath, manifestPath, key = "archive_sha256") {
+  await ensureFile(archivePath);
+  await ensureFile(manifestPath);
+  const manifest = JSON.parse(await fs.readFile(manifestPath, "utf-8"));
+  const have = await sha256(archivePath);
+  const want = manifest[key];
+  if (!want) fail("manifest.key.missing", { manifestPath, key });
+  if (want !== have) fail("archive.hash.mismatch", { archive: path.basename(archivePath), want, have });
+  log("archive.verified", { archive: path.basename(archivePath), sha256: have });
+  return manifest;
+}
+async function cleanUnpack() {
+  await fs.rm(UNPACK_ROOT, { recursive: true, force: true });
+  await fs.mkdir(CODE_UNPACK, { recursive: true });
+  await fs.mkdir(DEPS_UNPACK, { recursive: true });
+}
+async function unpack() {
+  log("unpack.begin", { archive: path.basename(CODE_ARCHIVE) });
+  await tar.x({ file: CODE_ARCHIVE, cwd: CODE_UNPACK, strip: 0 });
+  log("unpack.begin", { archive: path.basename(DEPS_ARCHIVE) });
+  await tar.x({ file: DEPS_ARCHIVE, cwd: DEPS_UNPACK, strip: 0 });
+  log("unpack.complete");
+}
+async function writeDirToVFS(pyodide, localDir, vfsDir) {
+  const FS = pyodide.FS;
+  try { FS.mkdirTree(vfsDir); } catch {}
+  const entries = await fs.readdir(localDir, { withFileTypes: true });
+  for (const e of entries) {
+    const lp = path.join(localDir, e.name);
+    const vp = path.join(vfsDir, e.name);
+    if (e.isDirectory()) await writeDirToVFS(pyodide, lp, vp);
+    else {
+      const data = await fs.readFile(lp);
+      FS.writeFile(vp, data);
     }
   }
 }
 
-/**
- * Executes a single agent task within the Pyodide environment.
- */
+async function stageWheelsToVFS(pyodide, hostVendorDir) {
+  const names = (await fs.readdir(hostVendorDir)).filter(f => f.endsWith(".whl")).sort();
+  for (const f of names) {
+    const data = await fs.readFile(path.join(hostVendorDir, f));
+    pyodide.FS.writeFile(`/tmp/wheels/${f}`, data);
+  }
+  return names;
+}
+
+/* Install a wheel into site-packages without micropip (bootstrap) */
+function wheelInstallPyCode(wheelPath, sitePackages) {
+  return `
+import sys, os, zipfile, shutil
+wheel = "${wheelPath}"
+target = "${sitePackages}"
+os.makedirs(target, exist_ok=True)
+with zipfile.ZipFile(wheel) as z:
+    z.extractall(target)
+# Normalize .data layout if present
+data_dir = None
+for n in os.listdir(target):
+    if n.endswith('.data'):
+        data_dir = os.path.join(target, n)
+        break
+if data_dir and os.path.isdir(data_dir):
+    for sub in ('purelib','platlib','data'):
+        p = os.path.join(data_dir, sub)
+        if os.path.isdir(p):
+            for root, dirs, files in os.walk(p):
+                rel = os.path.relpath(root, p)
+                dst = os.path.join(target, rel)
+                os.makedirs(dst, exist_ok=True)
+                for fn in files:
+                    shutil.move(os.path.join(root, fn), os.path.join(dst, fn))
+    shutil.rmtree(data_dir, ignore_errors=True)
+print("BOOTSTRAP_WHEEL_INSTALLED", wheel)
+  `.trim();
+}
+
+async function installBootstrap(pyodide, wheelNames) {
+  // site-packages in Pyodide
+  const sitePackages = "/lib/python3.11/site-packages";
+  pyodide.FS.mkdirTree("/tmp/wheels");
+  const need = ["micropip", "packaging"]; // plus their deps if present
+
+  const chosen = wheelNames.filter(n =>
+    need.some(k => n.startsWith(`${k}-`))
+  );
+  if (chosen.length === 0) {
+    log("bootstrap.warn", { msg: "no bootstrap wheels found, will attempt import" }, "warn");
+    return;
+  }
+
+  for (const w of chosen) {
+    const cmd = wheelInstallPyCode(`/tmp/wheels/${w}`, sitePackages);
+    try {
+      pyodide.runPython(cmd);
+      log("bootstrap.wheel.installed", { wheel: w });
+    } catch (e) {
+      fail("bootstrap.wheel.fail", { wheel: w, err: String(e?.message || e) });
+    }
+  }
+
+  try {
+    pyodide.runPython("import micropip, packaging; print('BOOTSTRAP_OK', micropip.__version__)");
+    log("bootstrap.ok");
+  } catch (e) {
+    fail("bootstrap.import.fail", { err: String(e?.message || e) });
+  }
+}
+
+async function installRemainingWithMicropip(pyodide, wheelNames) {
+  await installMicropipIfMissing(pyodide); // safety, no-op if installed
+
+  const micropip = pyodide.pyimport("micropip");
+  // Exclude bootstrap wheels from the remaining installs
+  const rest = wheelNames.filter(n => !n.startsWith("micropip-") && !n.startsWith("packaging-"));
+  for (const wheel of rest) {
+    log("micropip.install.begin", { wheel });
+    try {
+      await micropip.install(`emfs:/tmp/wheels/${wheel}`);
+      log("micropip.install.ok", { wheel });
+    } catch (e) {
+      fail("micropip.install.fail", { wheel, err: String(e?.message || e) });
+    }
+  }
+}
+
+async function installMicropipIfMissing(pyodide) {
+  try {
+    pyodide.runPython("import micropip");
+  } catch {
+    // try import again after bootstrap
+    try { pyodide.runPython("import micropip"); }
+    catch (e) { fail("micropip.absent.postbootstrap", { err: String(e?.message || e) }); }
+  }
+}
+
 async function executeAgentTask(pyodide, agentName, inputData) {
-  console.log(`\n--- Executing Agent: ${agentName} ---`);
-  
+  log("agent.exec.begin", { agentName });
   const vfsTapesPath = "/tapes";
   const inputTapePath = path.join(vfsTapesPath, "in.json");
   const outputTapePath = path.join(vfsTapesPath, "out.json");
 
-  // Map agent name to proper module name
-  const moduleMapping = {
-    'main': 'agent.main',
-    'multiplier': 'multiplier.main'
-  };
-  
+  const moduleMapping = { main: "agent.main", multiplier: "multiplier.main" };
   const agentModulePath = moduleMapping[agentName] || `${agentName}.main`;
-  console.log(`Loading agent module '${agentModulePath}'...`);
-  const agentModule = pyodide.pyimport(agentModulePath);
 
-  const agentConfig = agentName === 'main' ? { vector: [5, 10, 15] } : {};
+  const agentModule = pyodide.pyimport(agentModulePath);
+  const agentConfig = agentName === "main" ? { vector: [1,1,1] } : {};
   const agentInstance = agentModule.main(pyodide.toPy(agentConfig));
 
   const traceId = crypto.randomUUID();
-  console.log(`Generated Trace ID: ${traceId}`);
+  const tapeInput = { trace_id: traceId, payload: inputData };
 
-  const tapeInput = {
-    trace_id: traceId,
-    payload: inputData,
-  };
-  console.log(`Feeding input tape at '${inputTapePath}'...`);
+  pyodide.FS.mkdirTree(vfsTapesPath);
   pyodide.FS.writeFile(inputTapePath, JSON.stringify(tapeInput));
-  
   agentInstance.run(inputTapePath, outputTapePath);
 
-  console.log(`Reading output tape from '${outputTapePath}'...`);
   const resultRaw = pyodide.FS.readFile(outputTapePath, { encoding: "utf8" });
   const resultData = JSON.parse(resultRaw);
 
-  console.log("Verifying trace ID...");
-  if (resultData.trace_id === traceId) {
-    console.log("✅ Trace ID successfully verified.");
-  } else {
-    console.error(`❌ Trace ID mismatch! Expected ${traceId}, got ${resultData.trace_id}`);
-    throw new Error("Trace ID mismatch");
-  }
-  
+  if (resultData.trace_id !== traceId) fail("trace.mismatch", { expect: traceId, got: resultData.trace_id });
+
+  log("agent.exec.ok", { agentName, status: resultData.status });
   return resultData;
 }
 
-
+/* ========== Main Orchestration ========== */
 async function main() {
-  console.log("\n--- Stage 4: Starting Orchestration Runtime ---");
+  log("begin", { mode: "artifact-driven" });
 
-  const distPath = path.resolve("./dist");
-  const pyodideWasmPath = path.join(distPath, "pyodide-wasm");
-  const appSourcePath = path.join(distPath, "app");
-  const vfsAppPath = "/app";
+  // 1) Verify artifacts
+  await verifyArchive(CODE_ARCHIVE, CODE_MANIFEST);
+  await verifyArchive(DEPS_ARCHIVE, DEPS_MANIFEST);
 
+  // 2) Unpack artifacts
+  await cleanUnpack();
+  await unpack();
+
+  // 3) Boot Pyodide from code runtime
+  const runtimeHostPath = path.join(CODE_UNPACK, "runtime", "pyodide-wasm");
+  await fs.access(runtimeHostPath).catch(() => fail("runtime.missing", { runtimeHostPath }));
   const pyodide = await loadPyodide({
-    indexURL: pyodideWasmPath,
-    stdout: (text) => console.log(`[Python STDOUT] ${text}`),
-    stderr: (text) => console.error(`[Python STDERR] ${text}`),
+    indexURL: runtimeHostPath,
+    stdout: t => log("python.stdout", { msg: t.trim() }),
+    stderr: t => log("python.stderr", { msg: t.trim() }, "warn")
   });
+  log("pyodide.loaded");
 
-  await writeProjectToVFS(pyodide, appSourcePath, vfsAppPath);
-  console.log("Project files loaded into WASM.");
-
-  const vfsVendorPath = path.join(vfsAppPath, 'vendor');
-  if (pyodide.FS.analyzePath(vfsVendorPath).exists) {
-    console.log("Installing dependencies from local vendor directory...");
-    
-    // Load micropip first
-    await pyodide.loadPackage("micropip");
-    const micropip = pyodide.pyimport("micropip");
-    
-    // Get all wheel files
-    const wheelFiles = pyodide.FS.readdir(vfsVendorPath)
-      .filter(file => file.endsWith('.whl'));
-    
-    console.log(`Found ${wheelFiles.length} wheel files to install:`, wheelFiles);
-    
-    if (wheelFiles.length > 0) {
-      // Create a temporary directory in /tmp for micropip
-      pyodide.runPython(`
-import os
-os.makedirs('/tmp/wheels', exist_ok=True)
-      `);
-      
-      // Copy wheels to /tmp and install from there
-      for (const wheelFile of wheelFiles) {
-        const sourcePath = path.join(vfsVendorPath, wheelFile);
-        const destPath = `/tmp/wheels/${wheelFile}`;
-        
-        console.log(`Installing ${wheelFile}...`);
-        try {
-          // Copy the wheel to /tmp
-          const wheelData = pyodide.FS.readFile(sourcePath);
-          pyodide.FS.writeFile(destPath, wheelData);
-          
-          // Install using micropip with emfs:// protocol
-          await micropip.install(`emfs:${destPath}`);
-          console.log(`  ✅ Successfully installed ${wheelFile}`);
-        } catch (error) {
-          console.error(`  ❌ Failed to install ${wheelFile}:`, error.message);
-          
-          // Try installing with just the file path
-          try {
-            console.log(`  Trying direct path installation for ${wheelFile}...`);
-            await micropip.install(destPath);
-            console.log(`  ✅ Successfully installed ${wheelFile} via direct path`);
-          } catch (altError) {
-            console.error(`  ❌ Direct path installation also failed:`, altError.message);
-            // Don't throw here, continue with other packages
-            console.log(`  ⚠️ Skipping ${wheelFile}, continuing with other packages...`);
-          }
-        }
-      }
-      console.log("✅ Vendored packages installation process completed");
-    } else {
-      console.log("⚠️ No wheel files found in vendor directory");
-    }
-  } else {
-    console.log("⚠️ Vendor directory not found, skipping package installation");
-  }
-
-  // Dynamically find all agent directories within the VFS and add them to the Python path
-  const agentDirsInVfs = pyodide.FS.readdir(vfsAppPath)
-    .filter(name => {
-      try {
-        return pyodide.FS.isDir(pyodide.FS.stat(`${vfsAppPath}/${name}`).mode) && name !== 'vendor';
-      } catch (e) {
-        return false;
-      }
-    });
-  
-  console.log("Dynamically adding agent directories to Python path:", agentDirsInVfs);
-  
-  // Fix the indentation issue by properly formatting the Python code
-  const pythonCode = `
+  // 4) Load app to VFS and set sys.path
+  const appHostPath = path.join(CODE_UNPACK, "app");
+  await writeDirToVFS(pyodide, appHostPath, "/app");
+  pyodide.runPython(`
 import sys
-${agentDirsInVfs.map(dir => `sys.path.append('${vfsAppPath}/${dir}')`).join('\n')}
-print("Python path updated successfully")
-print("Available paths:", sys.path[-${agentDirsInVfs.length}:])
-  `.trim();
+if '/app' not in sys.path:
+    sys.path.append('/app')
+print('PY_PATH_OK', '/app' in sys.path)
+  `.trim());
+  log("app.vfs.ready");
 
-  console.log("Executing Python path setup...");
-  pyodide.runPython(pythonCode);
-  
-  pyodide.FS.mkdir("/tapes");
+  // 5) Stage wheels into VFS and offline-install
+  const hostVendorDir = path.join(DEPS_UNPACK, "vendor");
+  pyodide.FS.mkdirTree("/tmp/wheels");
+  const wheelNames = await stageWheelsToVFS(pyodide, hostVendorDir);
+  log("wheels.staged", { count: wheelNames.length });
 
-  // Check if numpy is available
+  await installBootstrap(pyodide, wheelNames);
+  await installRemainingWithMicropip(pyodide, wheelNames);
+
+  // 6) Boot audits
   try {
-    pyodide.runPython("import numpy; print('✅ NumPy is available:', numpy.__version__)");
-  } catch (error) {
-    console.error("❌ NumPy not available:", error.message);
-    console.log("This indicates the vendoring process may not have worked correctly.");
-    throw error;
+    pyodide.runPython("import numpy, sys; print('✅ NumPy', numpy.__version__)");
+    log("audit.numpy.ok");
+  } catch (e) {
+    fail("audit.numpy.fail", { err: String(e?.message || e) });
   }
 
-  // --- Orchestration Loop ---
-  let nextTask = {
-    agentName: "main",
-    inputData: { vector: [2, 4, 6] } // The initial input for the first agent
-  };
+  // 7) Orchestration loop
+  let nextTask = { agentName: "main", inputData: { vector: [2, 4, 6] } };
   let finalResult = null;
 
   while (nextTask) {
-    const result = await executeAgentTask(pyodide, nextTask.agentName, nextTask.inputData);
-
-    if (result.status === "complete") {
-      console.log("\n--- Workflow Complete ---");
-      finalResult = result.result;
-      nextTask = null; // Exit the loop
-    } else if (result.status === "pending" && result.action?.type === "run_agent") {
-      const actionPayload = result.action.payload;
-      console.log(`\n--- Workflow Pending: Received request to run '${actionPayload.agent_name}' ---`);
-      nextTask = {
-        agentName: actionPayload.agent_name,
-        inputData: actionPayload.input_data
-      };
-    } else {
-      console.error("Invalid response from agent:", result);
+    const res = await executeAgentTask(pyodide, nextTask.agentName, nextTask.inputData);
+    if (res.status === "complete") {
+      finalResult = res.result;
+      log("workflow.complete", { result: finalResult });
       nextTask = null;
+    } else if (res.status === "pending" && res.action?.type === "run_agent") {
+      const p = res.action.payload;
+      log("workflow.pending", { next: p.agent_name });
+      nextTask = { agentName: p.agent_name, inputData: p.input_data };
+    } else {
+      fail("agent.response.invalid", { res });
     }
   }
 
-  console.log("\nFinal result from agent workflow:", finalResult);
+  log("end", { finalResult });
 }
 
-main().catch(error => {
-  console.error("Runtime failed:", error);
-  process.exit(1);
-});
+main().catch(err => fail("fatal", { err: String(err?.message || err) }));

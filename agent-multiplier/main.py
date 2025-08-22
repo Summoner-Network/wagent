@@ -2,9 +2,8 @@ import json
 
 class MultiplierAgent:
     def __init__(self, config):
-        print("[MultiplierAgent] Initializing.")
-        # This agent doesn't need any config, but the main function provides it.
-        pass
+        print("[MultiplierAgent] Initializing with config:", config)
+        self.default_factor = config.get("default_factor", 2)
 
     def run(self, input_tape_path, output_tape_path):
         print(f"[MultiplierAgent] Reading from input tape: {input_tape_path}")
@@ -16,12 +15,13 @@ class MultiplierAgent:
         print(f"[MultiplierAgent] Received input with Trace ID: {trace_id}")
 
         number = payload.get("number", 0)
-        factor = payload.get("factor", 1)
-        result = number * factor
+        factor = payload.get("factor", self.default_factor)
         
-        print(f"[MultiplierAgent] Calculation: {number} * {factor} = {result}")
+        print(f"[MultiplierAgent] Multiplying {number} by {factor}")
+        result = number * factor
+        print(f"[MultiplierAgent] Result: {result}")
 
-        # This agent's job is simple, so it always returns a "complete" status.
+        # Always complete - multiplier is a simple operation
         output_data = {
             "trace_id": trace_id,
             "status": "complete",

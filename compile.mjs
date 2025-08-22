@@ -1,103 +1,129 @@
 import fs from "fs/promises";
 import path from "path";
 import { createRequire } from "module";
+import { execSync } from "child_process";
 
+/* ========== Structured Logger ========== */
+function now() { return new Date().toISOString(); }
+function log(event, data = {}, level = "info") {
+  const rec = { ts: now(), stage: "compile", level, event, ...data };
+  process.stdout.write(JSON.stringify(rec) + "\n");
+}
+function fail(event, data = {}) {
+  log(event, { ...data }, "error");
+  process.exit(1);
+}
+
+/* ========== Utilities ========== */
 const require = createRequire(import.meta.url);
 
-/**
- * Stage 1: Compile
- * Prepares the Pyodide WASM runtime by copying its distribution files
- * from node_modules into the 'dist' directory.
- */
+async function copyDir(src, dest) {
+  await fs.mkdir(dest, { recursive: true });
+  const entries = await fs.readdir(src, { withFileTypes: true });
+  for (const e of entries) {
+    const s = path.join(src, e.name);
+    const d = path.join(dest, e.name);
+    if (e.isDirectory()) await copyDir(s, d);
+    else await fs.copyFile(s, d);
+  }
+}
+
+function pkgVersionFromPackageJson(name, fallback = "^0.25.1") {
+  try {
+    const raw = require("fs").readFileSync(path.resolve("package.json"), "utf-8");
+    const pkg = JSON.parse(raw);
+    return (
+      (pkg.dependencies && pkg.dependencies[name]) ||
+      (pkg.devDependencies && pkg.devDependencies[name]) ||
+      fallback
+    );
+  } catch {
+    return fallback;
+  }
+}
+
+function ensureNodeDep(pkgName, versionRange) {
+  try {
+    require.resolve(`${pkgName}/package.json`);
+    log("dep.present", { pkgName });
+    return;
+  } catch {
+    const version = versionRange || "latest";
+    log("dep.install.begin", { pkgName, version });
+    try {
+      execSync(`npm install ${pkgName}@${version} --no-audit --no-fund --silent`, { stdio: "inherit" });
+      require.resolve(`${pkgName}/package.json`);
+      log("dep.install.ok", { pkgName, version });
+    } catch (e) {
+      fail("dep.install.fail", { pkgName, version, err: String(e?.message || e) });
+    }
+  }
+}
+
+/* ========== Main ========== */
 async function compile() {
-  console.log("--- Stage 1: Starting Compile Process ---");
+  log("begin");
+
+  // 1) Ensure pyodide present for a blank dir
+  const desiredPyodide = pkgVersionFromPackageJson("pyodide", "^0.25.1");
+  ensureNodeDep("pyodide", desiredPyodide);
 
   const distPath = path.resolve("./dist");
   const pyodideWasmPath = path.join(distPath, "pyodide-wasm");
+  const appStagePath = path.join(distPath, "app");
 
   await fs.rm(distPath, { recursive: true, force: true });
   await fs.mkdir(pyodideWasmPath, { recursive: true });
 
+  // 2) Locate and copy Pyodide runtime
   try {
-    // Find the path to the installed pyodide package
     const pyodidePackagePath = path.dirname(require.resolve("pyodide/package.json"));
-    console.log(`Pyodide package found at: ${pyodidePackagePath}`);
+    log("pyodide.located", { pyodidePackagePath });
 
-    // Check what directories exist in the pyodide package
-    const pyodideContents = await fs.readdir(pyodidePackagePath);
-    console.log(`Pyodide package contents: ${pyodideContents.join(', ')}`);
-
-    // Try different possible locations for Pyodide files
-    const possiblePaths = [
+    const candidates = [
+      pyodidePackagePath,                      // 0.25.x layout
       path.join(pyodidePackagePath, "dist"),
-      path.join(pyodidePackagePath, "pyodide"), 
-      pyodidePackagePath // Sometimes files are in the root
+      path.join(pyodidePackagePath, "pyodide"),
     ];
 
-    let pyodideDistPath = null;
-    let foundFiles = [];
-
-    for (const possiblePath of possiblePaths) {
+    let src = null;
+    for (const p of candidates) {
       try {
-        const stats = await fs.stat(possiblePath);
-        if (stats.isDirectory()) {
-          const contents = await fs.readdir(possiblePath);
-          console.log(`Contents of ${possiblePath}: ${contents.join(', ')}`);
-          
-          // Look for key Pyodide files
-          const hasWasm = contents.some(file => file.includes('.wasm'));
-          const hasJs = contents.some(file => file.includes('pyodide.js') || file.includes('pyodide.mjs'));
-          
-          if (hasWasm && hasJs) {
-            pyodideDistPath = possiblePath;
-            foundFiles = contents;
-            console.log(`✓ Found Pyodide files in: ${possiblePath}`);
-            break;
-          }
-        }
-      } catch (error) {
-        // Path doesn't exist, continue
-        continue;
-      }
+        const items = await fs.readdir(p);
+        const hasWasm = items.some(f => f.includes(".wasm"));
+        const hasJs = items.some(f => f.includes("pyodide.js") || f.includes("pyodide.mjs"));
+        if (hasWasm && hasJs) { src = p; log("pyodide.files.found", { path: p, items }); break; }
+      } catch { /* ignore */ }
     }
+    if (!src) fail("pyodide.files.missing");
 
-    if (!pyodideDistPath) {
-      throw new Error("Could not locate Pyodide distribution files. The package structure may have changed.");
-    }
-
-    console.log(`Copying Pyodide runtime from ${pyodideDistPath} to ${pyodideWasmPath}...`);
-    console.log(`Files to copy: ${foundFiles.join(', ')}`);
-
-    await fs.cp(pyodideDistPath, pyodideWasmPath, { recursive: true });
-
-    // Verify the copy was successful
-    const copiedFiles = await fs.readdir(pyodideWasmPath);
-    console.log(`✓ Successfully copied ${copiedFiles.length} files/directories`);
-    
-    // Check for essential files
-    const hasEssentials = copiedFiles.some(file => file.includes('.wasm')) && 
-                         copiedFiles.some(file => file.includes('pyodide.js') || file.includes('pyodide.mjs'));
-    
-    if (!hasEssentials) {
-      console.warn("⚠️  Warning: Essential Pyodide files (.wasm and .js/.mjs) may be missing");
-    }
-
+    await fs.cp(src, pyodideWasmPath, { recursive: true });
+    log("pyodide.copy.ok", { to: pyodideWasmPath });
   } catch (error) {
-    console.error("Failed to copy Pyodide files:", error.message);
-    
-    // Provide helpful debugging information
-    console.log("\n--- Debugging Information ---");
-    console.log("To resolve this issue, try the following:");
-    console.log("1. Ensure Pyodide is installed: npm install pyodide");
-    console.log("2. Check if you need a different version: npm install pyodide@latest");
-    console.log("3. Clear node_modules and reinstall: rm -rf node_modules && npm install");
-    console.log("4. Check the actual structure of your installed Pyodide package");
-    
-    process.exit(1);
+    fail("pyodide.copy.fail", { err: String(error?.message || error) });
   }
 
-  console.log("--- Compile Complete ---");
-  console.log(`Pyodide WASM runtime is ready in '${path.basename(pyodideWasmPath)}'.`);
+  // 3) Stage application source to dist/app and ensure agent packages
+  try {
+    await fs.mkdir(appStagePath, { recursive: true });
+    
+    // Copy main agent
+    await copyDir(path.resolve("./agent"), path.join(appStagePath, "agent"));
+    const initPath = path.join(appStagePath, "agent", "__init__.py");
+    await fs.writeFile(initPath, "", { flag: "a" });
+    
+    // Copy multiplier agent and rename it to 'multiplier' module
+    await copyDir(path.resolve("./agent-multiplier"), path.join(appStagePath, "multiplier"));
+    const multiplierInitPath = path.join(appStagePath, "multiplier", "__init__.py");
+    await fs.writeFile(multiplierInitPath, "", { flag: "a" });
+    
+    await fs.mkdir(path.join(appStagePath, "tapes"), { recursive: true });
+    log("app.stage.ok", { appStagePath });
+  } catch (e) {
+    fail("app.stage.fail", { err: String(e?.message || e) });
+  }
+
+  log("complete", { distPath, pyodideWasmPath, appStagePath });
 }
 
 compile();

@@ -1,7 +1,7 @@
 {
   "name": "wasm-agent-runner",
-  "version": "1.0.0",
-  "description": "A project to run a Python agent in a WASM environment.",
+  "version": "1.1.0",
+  "description": "Deterministic artifact-driven Pyodide runner with structured logging.",
   "type": "module",
   "main": "run.mjs",
   "scripts": {
@@ -10,13 +10,10 @@
     "vendor": "node vendor.mjs",
     "package": "node package.mjs",
     "build": "npm run clean && npm run compile && npm run vendor && npm run package",
-    "start": "node run.mjs",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node run.mjs"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
   "dependencies": {
-    "pyodide": "0.24.1"
+    "pyodide": "^0.25.1",
+    "tar": "^7.4.3"
   }
 }
