@@ -2,44 +2,53 @@ import { loadPyodide } from "pyodide";
 import path from "path";
 import fs from "fs/promises";
 
-async function run() {
-  console.log("\n--- Stage 3: Starting Production Runtime ---");
+// Helper to recursively write a local directory to the virtual FS
+async function writeProjectToVFS(pyodide, localPath, vfsPath) {
+  await pyodide.FS.mkdirTree(vfsPath);
+  const entries = await fs.readdir(localPath, { withFileTypes: true });
+  for (let entry of entries) {
+    const localEntryPath = path.join(localPath, entry.name);
+    const vfsEntryPath = path.join(vfsPath, entry.name);
+    if (entry.isDirectory()) {
+      await writeProjectToVFS(pyodide, localEntryPath, vfsEntryPath);
+    } else {
+      const content = await fs.readFile(localEntryPath);
+      pyodide.FS.writeFile(vfsEntryPath, content);
+    }
+  }
+}
 
-  const distPath = path.resolve("./dist/agent");
+async function run() {
+  console.log("\n--- Stage 3: Starting Robust Production Runtime ---");
+
+  const distPath = path.resolve("./dist");
+  const vfsAppPath = "/app";
+
   console.log("Loading Pyodide runtime...");
   const pyodide = await loadPyodide();
 
-  // --- FIX: Manually write files to the virtual filesystem ---
-  console.log("Writing project files to virtual filesystem...");
-  // Create the directory structure inside WASM
-  pyodide.FS.mkdirTree("/app/agent");
-
-  // Read files from the 'dist' directory and write them to WASM
-  const mainPyContent = await fs.readFile(path.join(distPath, "main.py"));
-  pyodide.FS.writeFile("/app/agent/main.py", mainPyContent);
-
-  const requirementsContent = await fs.readFile(path.join(distPath, "requirements.txt"));
-  pyodide.FS.writeFile("/app/agent/requirements.txt", requirementsContent);
+  // Recursively write the entire project from 'dist' to the virtual FS
+  console.log(`Writing project files from '${path.basename(distPath)}' to VFS at '${vfsAppPath}'...`);
+  await writeProjectToVFS(pyodide, distPath, vfsAppPath);
   console.log("Project files loaded into WASM.");
-  
-  // Install dependencies from the packaged requirements.txt
-  console.log("Installing dependencies from /app/agent/requirements.txt...");
-  await pyodide.loadPackage("micropip");
-  const micropip = pyodide.pyimport("micropip");
 
-  const requirementsFromVFS = pyodide.FS.readFile("/app/agent/requirements.txt", { encoding: "utf8" });
-  const requirementsList = requirementsFromVFS.split("\n").filter(Boolean);
-  if (requirementsList.length > 0) {
-    await micropip.install(requirementsList);
+  // Install dependencies if requirements.txt exists
+  const requirementsPath = path.join(vfsAppPath, "requirements.txt");
+  if (pyodide.FS.analyzePath(requirementsPath).exists) {
+    console.log("Installing dependencies from requirements.txt...");
+    await pyodide.loadPackage("micropip");
+    const micropip = pyodide.pyimport("micropip");
+    const requirements = pyodide.FS.readFile(requirementsPath, { encoding: "utf8" });
+    await micropip.install(requirements.split("\n").filter(Boolean));
   }
 
-  // Add the agent's code to the Python path
+  // Add the project root to the Python path
   pyodide.runPython(`
     import sys
-    sys.path.append('/app/agent')
+    sys.path.append('${vfsAppPath}')
   `);
 
-  console.log("Loading agent module...");
+  console.log("Loading agent module 'main'...");
   const mainModule = pyodide.pyimport("main");
 
   // Create an instance of the agent
@@ -52,7 +61,7 @@ async function run() {
   const result = agentInstance.run(pyodide.toPy(inputData));
 
   console.log("--- Task Complete ---");
-  console.log("Result from agent:", result.toJs()); // Convert Pyodide object back to JS
+  console.log("Result from agent:", result.toJs());
 }
 
 run();

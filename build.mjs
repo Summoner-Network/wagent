@@ -1,43 +1,33 @@
-import { loadPyodide } from "pyodide";
 import fs from "fs/promises";
 import path from "path";
 
-async function build() {
-  console.log("--- Stage 2: Starting Build Process ---");
+// Helper function to recursively copy a directory
+async function copyDir(src, dest) {
+  await fs.mkdir(dest, { recursive: true });
+  const entries = await fs.readdir(src, { withFileTypes: true });
+  for (let entry of entries) {
+    const srcPath = path.join(src, entry.name);
+    const destPath = path.join(dest, entry.name);
+    entry.isDirectory() ? await copyDir(srcPath, destPath) : await fs.copyFile(srcPath, destPath);
+  }
+}
 
-  // Ensure the output directory exists and is clean
+async function build() {
+  console.log("--- Stage 2: Starting Robust Build Process ---");
+
+  const sourcePath = path.resolve("./agent");
   const distPath = path.resolve("./dist");
+
+  // Clean and recreate the dist directory
   await fs.rm(distPath, { recursive: true, force: true });
   await fs.mkdir(distPath, { recursive: true });
 
-  console.log("Initializing a temporary Pyodide instance...");
-  const pyodide = await loadPyodide();
-
-  console.log("Loading micropip to fetch dependencies...");
-  await pyodide.loadPackage("micropip");
-  const micropip = pyodide.pyimport("micropip");
-
-  // Install dependencies from requirements.txt
-  const requirements = await fs.readFile("./agent/requirements.txt", "utf8");
-  console.log("Installing dependencies...");
-  await micropip.install(requirements.split('\n').filter(Boolean));
-
-  // This is where a real build process would package the installed wheels.
-  // For simplicity in this demo, we will reinstall them at runtime,
-  // but we'll copy our agent's source code to the 'dist' folder.
-  console.log("Copying agent source code to dist/agent...");
-  await fs.mkdir(path.join(distPath, "agent"));
-  await fs.copyFile(
-    "./agent/main.py",
-    path.join(distPath, "agent/main.py")
-  );
-  await fs.copyFile(
-    "./agent/requirements.txt",
-    path.join(distPath, "agent/requirements.txt")
-  );
+  // Recursively copy the entire agent project
+  console.log(`Copying agent source from ${sourcePath} to ${distPath}...`);
+  await copyDir(sourcePath, distPath);
 
   console.log("--- Build Complete ---");
-  console.log("Production artifact is ready in the 'dist' directory.");
+  console.log(`Production artifact is ready in the '${path.basename(distPath)}' directory.`);
 }
 
 build();
