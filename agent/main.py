@@ -42,7 +42,7 @@ class SimpleAgent:
             # Determine factor based on how far we are from target
             gap = self.target_threshold - number
             if gap > 50:
-                factor = 10  # Big jump needed
+                factor = 3  # Big jump needed
             elif gap > 20:
                 factor = 5   # Medium jump
             else:
