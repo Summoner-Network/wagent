@@ -1,6 +1,8 @@
 import json
 
 class MultiplierAgent:
+    # The __init__ method doesn't need to change, as this agent
+    # does not use any host capabilities.
     def __init__(self, config):
         print("[MultiplierAgent] Initializing with config:", config)
         self.default_factor = config.get("default_factor", 2)
@@ -21,13 +23,11 @@ class MultiplierAgent:
         result = number * factor
         print(f"[MultiplierAgent] Result: {result}")
 
-        # Check if we need to return to another agent for further processing
         return_to = payload.get("return_to")
         original_payload = payload.get("original_payload", {})
         
         if return_to:
             print(f"[MultiplierAgent] Returning result to {return_to} for further processing")
-            # Return to the specified agent with the processed result
             output_data = {
                 "trace_id": trace_id,
                 "status": "pending",
@@ -36,14 +36,13 @@ class MultiplierAgent:
                     "payload": {
                         "agent_name": return_to,
                         "input_data": {
-                            **original_payload,  # Include original context
-                            "processed_result": float(result)  # Add our processed result
+                            **original_payload,
+                            "processed_result": float(result)
                         }
                     }
                 }
             }
         else:
-            # No return specified - this is a terminal operation
             print("[MultiplierAgent] No return agent specified. Completing task.")
             output_data = {
                 "trace_id": trace_id,
@@ -55,5 +54,8 @@ class MultiplierAgent:
         with open(output_tape_path, 'w') as f:
             json.dump(output_data, f)
 
-def main(config):
+# CORRECTED: The factory function now accepts the optional host_capabilities
+# argument, even though it doesn't use it. This makes it compatible
+# with the orchestrator's call signature.
+def main(config, host_capabilities=None):
     return MultiplierAgent(config)

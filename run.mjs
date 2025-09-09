@@ -33,7 +33,7 @@ async function loadAgentRegistry(pyodide) {
   try {
     const registryData = pyodide.FS.readFile("/app/agent_registry.json", { encoding: "utf8" });
     agentRegistry = JSON.parse(registryData);
-    log("agent.registry.loaded", { 
+    log("agent.registry.loaded", {
       agentCount: agentRegistry.agents.length,
       rootAgent: agentRegistry.rootAgent,
       agents: agentRegistry.agents.map(a => a.name)
@@ -48,15 +48,15 @@ function getAgentModulePath(agentName) {
   if (!agentRegistry) {
     fail("agent.registry.not.loaded");
   }
-  
+
   const agent = agentRegistry.agents.find(a => a.name === agentName);
   if (!agent) {
-    fail("agent.not.found", { 
-      agentName, 
+    fail("agent.not.found", {
+      agentName,
       available: agentRegistry.agents.map(a => a.name)
     });
   }
-  
+
   return agent.modulePath;
 }
 
@@ -206,9 +206,9 @@ async function installMicropipIfMissing(pyodide) {
   }
 }
 
-async function executeAgentTask(pyodide, agentName, inputData, agentConfig = {}) {
+async function executeAgentTask(pyodide, agentName, inputData, agentConfig = {}, hostCapabilities = {}) {
   log("agent.exec.begin", { agentName });
-  
+
   const vfsTapesPath = "/tapes";
   const inputTapePath = path.join(vfsTapesPath, "in.json");
   const outputTapePath = path.join(vfsTapesPath, "out.json");
@@ -220,16 +220,19 @@ async function executeAgentTask(pyodide, agentName, inputData, agentConfig = {})
   try {
     // Import the agent module
     const agentModule = pyodide.pyimport(agentModulePath);
-    
-    // Create agent instance with config
-    const agentInstance = agentModule.main(pyodide.toPy(agentConfig));
+
+    // Create agent instance with config and host capabilities
+    const agentInstance = agentModule.main(
+      pyodide.toPy(agentConfig),
+      pyodide.toPy(hostCapabilities)
+    );
 
     const traceId = crypto.randomUUID();
     const tapeInput = { trace_id: traceId, payload: inputData };
 
     pyodide.FS.mkdirTree(vfsTapesPath);
     pyodide.FS.writeFile(inputTapePath, JSON.stringify(tapeInput));
-    
+
     // Execute agent
     agentInstance.run(inputTapePath, outputTapePath);
 
@@ -242,12 +245,12 @@ async function executeAgentTask(pyodide, agentName, inputData, agentConfig = {})
 
     log("agent.exec.ok", { agentName, status: resultData.status });
     return resultData;
-    
+
   } catch (e) {
-    fail("agent.exec.fail", { 
-      agentName, 
+    fail("agent.exec.fail", {
+      agentName,
       modulePath: agentModulePath,
-      err: String(e?.message || e) 
+      err: String(e?.message || e)
     });
   }
 }
@@ -285,10 +288,22 @@ print('PY_PATH_OK', '/app' in sys.path)
   `.trim());
   log("app.vfs.ready");
 
-  // 5) Load agent registry
+  // 5) Define and register host capabilities as a Python module
+  const hostCapabilities = {
+    getHostInfo: () => {
+      log("host.capability.called", { function: "getHostInfo" });
+      return "Hello from the Node.js Host! Version: " + process.version;
+    },
+  };
+  // CORRECT: Use registerJsModule to make the object importable in Python
+  pyodide.registerJsModule("host", hostCapabilities);
+  log("host.capabilities.injected", { capabilities: Object.keys(hostCapabilities) });
+
+
+  // 6) Load agent registry
   await loadAgentRegistry(pyodide);
 
-  // 6) Stage wheels and install dependencies
+  // 7) Stage wheels and install dependencies
   const hostVendorDir = path.join(DEPS_UNPACK, "vendor");
   pyodide.FS.mkdirTree("/tmp/wheels");
   const wheelNames = await stageWheelsToVFS(pyodide, hostVendorDir);
@@ -297,11 +312,11 @@ print('PY_PATH_OK', '/app' in sys.path)
   await installBootstrap(pyodide, wheelNames);
   await installRemainingWithMicropip(pyodide, wheelNames);
 
-  // 7) Boot audits
+  // 8) Boot audits
   try {
     pyodide.runPython("import sys; print('✅ Python', sys.version.split()[0])");
     log("audit.python.ok");
-    
+
     // Test import of available packages
     try {
       pyodide.runPython("import numpy; print('✅ NumPy', numpy.__version__)");
@@ -313,17 +328,17 @@ print('PY_PATH_OK', '/app' in sys.path)
     fail("audit.python.fail", { err: String(e?.message || e) });
   }
 
-  // 8) Orchestration loop - start with root agent
+  // 9) Orchestration loop - start with root agent
   const rootAgentName = agentRegistry.rootAgent;
-  let nextTask = { 
-    agentName: rootAgentName, 
+  let nextTask = {
+    agentName: rootAgentName,
     inputData: { vector: [2, 4, 6] },
-    agentConfig: { vector: [1, 1, 1], target_threshold: 100 }  // Default config for root agent
+    agentConfig: { vector: [1, 1, 1], target_threshold: 100 }
   };
   let finalResult = null;
   let stepCount = 0;
-  const maxSteps = 20; // Allow more steps for iterative patterns
-  
+  const maxSteps = 20;
+
   // Track progress for infinite loop detection
   let progressHistory = [];
   let stagnantSteps = 0;
@@ -334,25 +349,26 @@ print('PY_PATH_OK', '/app' in sys.path)
   while (nextTask && stepCount < maxSteps) {
     stepCount++;
     log("workflow.step", { step: stepCount, agentName: nextTask.agentName });
-    
+
     const res = await executeAgentTask(
-      pyodide, 
-      nextTask.agentName, 
+      pyodide,
+      nextTask.agentName,
       nextTask.inputData,
-      nextTask.agentConfig || {}
+      nextTask.agentConfig || {},
+      hostCapabilities
     );
-    
+
     if (res.status === "complete") {
       finalResult = res.result;
       log("workflow.complete", { result: finalResult, steps: stepCount, progressHistory });
       nextTask = null;
     } else if (res.status === "pending" && res.action?.type === "run_agent") {
       const p = res.action.payload;
-      
+
       // Track progress to detect infinite loops
       const currentProgress = p.input_data.processed_result || p.input_data.number || 0;
       progressHistory.push({ step: stepCount, agent: nextTask.agentName, progress: currentProgress });
-      
+
       // Check if we're making progress
       if (progressHistory.length >= 2) {
         const lastProgress = progressHistory[progressHistory.length - 2].progress;
@@ -362,25 +378,25 @@ print('PY_PATH_OK', '/app' in sys.path)
           stagnantSteps = 0; // Reset if we made progress
         }
       }
-      
+
       if (stagnantSteps >= maxStagnantSteps) {
-        fail("workflow.stagnant", { 
-          stagnantSteps, 
-          maxStagnantSteps, 
+        fail("workflow.stagnant", {
+          stagnantSteps,
+          maxStagnantSteps,
           progressHistory,
           msg: "Workflow appears stuck - no progress being made"
         });
       }
-      
-      log("workflow.pending", { 
-        next: p.agent_name, 
-        step: stepCount, 
+
+      log("workflow.pending", {
+        next: p.agent_name,
+        step: stepCount,
         currentProgress,
-        stagnantSteps 
+        stagnantSteps
       });
-      
-      nextTask = { 
-        agentName: p.agent_name, 
+
+      nextTask = {
+        agentName: p.agent_name,
         inputData: p.input_data,
         agentConfig: p.agent_config || {}
       };
@@ -390,11 +406,11 @@ print('PY_PATH_OK', '/app' in sys.path)
   }
 
   if (stepCount >= maxSteps) {
-    fail("workflow.max.steps", { 
-      maxSteps, 
-      finalStep: stepCount, 
+    fail("workflow.max.steps", {
+      maxSteps,
+      finalStep: stepCount,
       progressHistory,
-      msg: "Reached maximum workflow steps" 
+      msg: "Reached maximum workflow steps"
     });
   }
 
@@ -402,3 +418,5 @@ print('PY_PATH_OK', '/app' in sys.path)
 }
 
 main().catch(err => fail("fatal", { err: String(err?.message || err) }));
+
+
