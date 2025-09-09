@@ -206,6 +206,7 @@ async function installMicropipIfMissing(pyodide) {
   }
 }
 
+// ASYNC CHANGE: This function is now async because the agent's run method might be a coroutine.
 async function executeAgentTask(pyodide, agentName, inputData, agentConfig = {}, hostCapabilities = {}) {
   log("agent.exec.begin", { agentName });
 
@@ -213,15 +214,12 @@ async function executeAgentTask(pyodide, agentName, inputData, agentConfig = {},
   const inputTapePath = path.join(vfsTapesPath, "in.json");
   const outputTapePath = path.join(vfsTapesPath, "out.json");
 
-  // Get module path from registry
   const agentModulePath = getAgentModulePath(agentName);
   log("agent.module.resolve", { agentName, modulePath: agentModulePath });
 
   try {
-    // Import the agent module
     const agentModule = pyodide.pyimport(agentModulePath);
 
-    // Create agent instance with config and host capabilities
     const agentInstance = agentModule.main(
       pyodide.toPy(agentConfig),
       pyodide.toPy(hostCapabilities)
@@ -233,8 +231,8 @@ async function executeAgentTask(pyodide, agentName, inputData, agentConfig = {},
     pyodide.FS.mkdirTree(vfsTapesPath);
     pyodide.FS.writeFile(inputTapePath, JSON.stringify(tapeInput));
 
-    // Execute agent
-    agentInstance.run(inputTapePath, outputTapePath);
+    // ASYNC CHANGE: The agent's run method might be a Promise (awaitable coroutine), so we must await it.
+    await agentInstance.run(inputTapePath, outputTapePath);
 
     const resultRaw = pyodide.FS.readFile(outputTapePath, { encoding: "utf8" });
     const resultData = JSON.parse(resultRaw);
@@ -288,17 +286,24 @@ print('PY_PATH_OK', '/app' in sys.path)
   `.trim());
   log("app.vfs.ready");
 
-  // 5) Define and register host capabilities as a Python module
+  // 5) Define and register host capabilities, including an async one
   const hostCapabilities = {
     getHostInfo: () => {
       log("host.capability.called", { function: "getHostInfo" });
       return "Hello from the Node.js Host! Version: " + process.version;
     },
+    // This function is async and returns a promise.
+    fetchExternalData: async () => {
+      log("host.capability.called.async.begin", { function: "fetchExternalData" });
+      // Simulate a 1-second network delay
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      const result = { data: "This data came from an external API", timestamp: Date.now() };
+      log("host.capability.called.async.end", { function: "fetchExternalData" });
+      return result;
+    }
   };
-  // CORRECT: Use registerJsModule to make the object importable in Python
   pyodide.registerJsModule("host", hostCapabilities);
   log("host.capabilities.injected", { capabilities: Object.keys(hostCapabilities) });
-
 
   // 6) Load agent registry
   await loadAgentRegistry(pyodide);
@@ -316,8 +321,6 @@ print('PY_PATH_OK', '/app' in sys.path)
   try {
     pyodide.runPython("import sys; print('✅ Python', sys.version.split()[0])");
     log("audit.python.ok");
-
-    // Test import of available packages
     try {
       pyodide.runPython("import numpy; print('✅ NumPy', numpy.__version__)");
       log("audit.numpy.ok");
@@ -339,7 +342,6 @@ print('PY_PATH_OK', '/app' in sys.path)
   let stepCount = 0;
   const maxSteps = 20;
 
-  // Track progress for infinite loop detection
   let progressHistory = [];
   let stagnantSteps = 0;
   const maxStagnantSteps = 5;
@@ -364,18 +366,15 @@ print('PY_PATH_OK', '/app' in sys.path)
       nextTask = null;
     } else if (res.status === "pending" && res.action?.type === "run_agent") {
       const p = res.action.payload;
-
-      // Track progress to detect infinite loops
       const currentProgress = p.input_data.processed_result || p.input_data.number || 0;
       progressHistory.push({ step: stepCount, agent: nextTask.agentName, progress: currentProgress });
 
-      // Check if we're making progress
       if (progressHistory.length >= 2) {
         const lastProgress = progressHistory[progressHistory.length - 2].progress;
         if (currentProgress <= lastProgress) {
           stagnantSteps++;
         } else {
-          stagnantSteps = 0; // Reset if we made progress
+          stagnantSteps = 0;
         }
       }
 
@@ -418,5 +417,3 @@ print('PY_PATH_OK', '/app' in sys.path)
 }
 
 main().catch(err => fail("fatal", { err: String(err?.message || err) }));
-
-
